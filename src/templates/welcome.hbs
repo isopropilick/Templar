@@ -1,0 +1,11 @@
+{{#> base title="Welcome!"}}
+  <h1 style="margin-top:0">¡Hi, {{name}}!</h1>
+  <p>Thank you for your trust in <strong>{{product}}</strong>.</p>
+  {{#if verify_url}}
+    <p>
+      <a class="btn" style="background:#2563eb;color:#fff" href="{{verify_url}}">
+        Confirm email
+      </a>
+    </p>
+  {{/if}}
+{{/base}}
