@@ -26,16 +26,22 @@ A minimal Rust microservice to send transactional emails from JSON payloads usin
 Copy `.env` (already included) and set your values:
 
 ```env
+# HTTP
+API_KEY=dev-secret-token
+API_KEY_CURRENT_REQUEST=dev-secret-token
 LISTEN_ADDR=127.0.0.1
 LISTEN_PORT=3000
+
+# Mail (SMTP)
 SMTP_HOST=smtp.mailgun.org
 SMTP_PORT=587
-SMTP_USERNAME=notifications@dontreply.qa-cloud.com
-SMTP_PASSWORD=password
-MAIL_FROM=notifications@dontreply.qa-cloud.com
-MAIL_REPLY_TO=notifications@dontreply.qa-cloud.com
-# Templates directory
-TEMPLATES_DIR=templates
+SMTP_USERNAME=notifications@domain.com
+SMTP_PASSWORD=secret-password
+MAIL_FROM=notifications@domain.com
+MAIL_REPLY_TO=notifications@domain.com
+
+# Templates directory (relative to project root or absolute)
+TEMPLATES_DIR=src/templates
 ```
 
 ### Run
