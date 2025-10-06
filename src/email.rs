@@ -4,15 +4,30 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use handlebars::Handlebars;
-use lettre::{
-    message::{header, Mailbox, MultiPart, SinglePart},
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-};
+use lettre::{message::{header, Mailbox, MultiPart, SinglePart}, transport::file::AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use once_cell::sync::OnceCell;
 use serde_json::Value;
 use thiserror::Error;
 
 static REGISTRY: OnceCell<Handlebars<'static>> = OnceCell::new();
+
+/// Transport selected at runtime (SMTP for prod, FILE for local dev).
+#[derive(Clone)]
+pub enum Mailer {
+    Smtp(AsyncSmtpTransport<Tokio1Executor>),
+    File(AsyncFileTransport<Tokio1Executor>),
+}
+
+impl Mailer {
+    /// Unified `send` so callers don't care which transport we're using.
+    /// We normalize errors to String to avoid mixing different transport error types.
+    pub async fn send(&self, email: Message) -> Result<(), String> {
+        match self {
+            Mailer::Smtp(m) => m.send(email).await.map(|_| ()).map_err(|e| e.to_string()),
+            Mailer::File(f) => f.send(email).await.map(|_| ()).map_err(|e| e.to_string()),
+        }
+    }
+}
 
 /// Domain errors we surface to the handler layer.
 #[derive(Debug, Error)]
@@ -27,10 +42,10 @@ pub enum EmailError {
     Config(String),
 }
 
-/// App-wide email state (SMTP client + addressing + templates location).
+/// App-wide email state (transport + addressing + templates location).
 #[derive(Clone)]
 pub struct EmailState {
-    pub mailer: AsyncSmtpTransport<Tokio1Executor>,
+    pub mailer: Mailer,
     pub from: Mailbox,
     pub reply_to: Option<Mailbox>,
     pub templates_dir: PathBuf,
@@ -39,34 +54,32 @@ pub struct EmailState {
 impl EmailState {
     /// Build state from environment variables and initialize the Handlebars registry.
     ///
-    /// Required envs:
+    /// Required envs (for SMTP mode):
     /// - SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, MAIL_FROM
-    ///
     /// Optional:
     /// - SMTP_PORT (default 587), MAIL_REPLY_TO, TEMPLATES_DIR (default "src/templates")
+    /// - MAIL_TRANSPORT = "smtp" (default) | "file"
+    /// - MAIL_FILE_DIR (default "outbox/") — only used when MAIL_TRANSPORT=file
     pub fn from_env() -> Result<Self, anyhow::Error> {
-        let smtp_host = std::env::var("SMTP_HOST")?;
-        let smtp_port = std::env::var("SMTP_PORT")
-            .unwrap_or_else(|_| "587".into())
-            .parse::<u16>()?;
-        let smtp_user = std::env::var("SMTP_USERNAME")?;
-        let smtp_pass = std::env::var("SMTP_PASSWORD")?;
-
+        // Common addressing
         let from: Mailbox = std::env::var("MAIL_FROM")?
             .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid MAIL_FROM: {e}"))?;
-
-        let reply_to = std::env::var("MAIL_REPLY_TO")
-            .ok()
-            .and_then(|s| s.parse::<Mailbox>().ok());
-
-        let templates_dir = std::env::var("TEMPLATES_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("src/templates"));
-
-        let mailer = build_mailer(&smtp_host, smtp_port, &smtp_user, &smtp_pass)?;
+            .map_err(|e| anyhow::anyhow!(format!("Invalid MAIL_FROM: {e}")))?;
+        let reply_to = std::env::var("MAIL_REPLY_TO").ok().and_then(|s| s.parse::<Mailbox>().ok());
+        let templates_dir = PathBuf::from(std::env::var("TEMPLATES_DIR").unwrap_or_else(|_| "src/templates".into()));
+        // Init HandleBars registry (strict mode, base.hbs partial, etc.)
         init_registry(&templates_dir)?;
-
+        // Choose transport
+        let transport = std::env::var("MAIL_TRANSPORT").unwrap_or_else(|_| "smtp".into()).to_lowercase();
+        // Set defaults for SMTP
+        let host = std::env::var("SMTP_HOST").unwrap_or_else(|_| "localhost".into());
+        let port = std::env::var("SMTP_PORT").unwrap_or_else(|_| "587".into()).parse::<u16>()?;
+        let username = std::env::var("SMTP_USERNAME").unwrap_or_else(|_| "user".into());
+        let password = std::env::var("SMTP_PASSWORD").unwrap_or_else(|_| "password".into());
+        // Build transport
+        let mailer;
+        if transport == "file" {mailer = build_file_mailer()?;}
+        else {mailer = build_smtp_mailer(&host, port, &username, &password)?;}
         Ok(Self {
             mailer,
             from,
@@ -76,25 +89,33 @@ impl EmailState {
     }
 }
 
-/// Configure a STARTTLS SMTP transport with credentials and a short timeout.
-pub fn build_mailer(
+/// Build a STARTTLS SMTP transport with creds and short timeout.
+fn build_smtp_mailer(
     host: &str,
     port: u16,
     user: &str,
     pass: &str,
-) -> Result<AsyncSmtpTransport<Tokio1Executor>, anyhow::Error> {
+) -> Result<Mailer, anyhow::Error> {
     use lettre::transport::smtp::authentication::Credentials;
 
     let creds = Credentials::new(user.to_string(), pass.to_string());
-    Ok(
+    Ok(Mailer::Smtp(
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?
             .port(port)
             .credentials(creds)
             .timeout(Some(Duration::from_secs(15)))
             .build(),
-    )
+    ))
 }
-
+/// Build a file transport (writes `.eml` files), used for local/dev.
+fn build_file_mailer() -> Result<Mailer, anyhow::Error> {
+    use std::fs;
+    use std::path::Path;
+    let dir = std::env::var("MAIL_FILE_DIR").unwrap_or_else(|_| "outbox".into());
+    fs::create_dir_all(&dir)?;
+    let root = Path::new(&dir).to_path_buf();
+    Ok(Mailer::File(AsyncFileTransport::new(root)))
+}
 /// Initialize a global Handlebars registry in strict mode.
 /// We pre-register the `base` layout as a **partial** (used by `{{#> base}} ... {{/base}}`).
 fn init_registry(dir: &std::path::Path) -> Result<(), anyhow::Error> {
@@ -150,13 +171,8 @@ pub async fn render_and_send(
         )
         .map_err(|e| EmailError::Config(format!("message build error: {e}")))?;
 
-    // 4) Send
-    state
-        .mailer
-        .send(email)
-        .await
-        .map_err(|e| EmailError::SmtpError(e.to_string()))?;
-
+    // 4) Send (or write to file, depending on transport)
+    state.mailer.send(email).await.map_err(|e| EmailError::SmtpError(e.to_string()))?;
     Ok(nanoid())
 }
 
@@ -167,8 +183,8 @@ fn parse_recipients(to: &str) -> Result<Vec<Mailbox>, lettre::address::AddressEr
 
 /// Generate a compact pseudo message id (22 chars, URL-safe).
 fn nanoid() -> String {
-    use rand::{distributions::Alphanumeric, thread_rng, Rng};
-    thread_rng()
+    use rand::{distr::Alphanumeric, rng, Rng};
+    rng()
         .sample_iter(&Alphanumeric)
         .take(22)
         .map(char::from)
